@@ -10,6 +10,7 @@ from redis.connection import (
     SSLConnection,
     UnixDomainSocketConnection,
 )
+from redis._lease import ConnectionLease, LeasePhase
 from redis.credentials import CredentialProvider, UsernamePasswordCredentialProvider
 from redis.keyspace_notifications import (
     ChannelType,
@@ -77,6 +78,8 @@ __all__ = [
     "ChannelType",
     "ChildDeadlockedError",
     "ClusterKeyspaceNotifications",
+    "ConnectionLease",
+    "LeasePhase",
     "Connection",
     "ConnectionError",
     "ConnectionPool",

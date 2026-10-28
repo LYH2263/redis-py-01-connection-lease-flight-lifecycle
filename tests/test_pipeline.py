@@ -953,3 +953,95 @@ class TestPipelineMetricsRecording:
             assert "error.type" in error_attrs
 
         recorder.reset_collector()
+
+
+class _SyncResetStubConnection:
+    """Minimal connection surface exercised by sync Pipeline.reset()."""
+
+    def __init__(self, *, read_error=None):
+        self.lease = redis.ConnectionLease()
+        self.is_connected = True
+        self.disconnect_count = 0
+        self._read_error = read_error
+
+    def should_reconnect(self):
+        return False
+
+    def mark_for_reconnect(self):
+        pass
+
+    def disconnect(self, *args, **kwargs):
+        self.disconnect_count += 1
+        self.is_connected = False
+
+    def send_command(self, *args, **kwargs):
+        self.lease.mark_write_inflight()
+
+    def read_response(self, *args, **kwargs):
+        self.lease.mark_await_read()
+        if self._read_error is not None:
+            raise self._read_error
+        return True
+
+
+def _make_sync_reset_pipeline(connection, pool):
+    pipeline = Pipeline(
+        connection_pool=pool,
+        response_callbacks={},
+        transaction=True,
+        shard_hint=None,
+    )
+    pipeline.connection = connection
+    pipeline.watching = True
+    return pipeline
+
+
+class TestSyncPipelineResetLease:
+    """Offline lease-flight tests for the sync standalone Pipeline.reset
+    exit (forked from the async reset test class by design)."""
+
+    def test_reset_unwatch_success_completed_clean(self):
+        pool = mock.MagicMock()
+        connection = _SyncResetStubConnection()
+        connection.lease.begin()
+        pipeline = _make_sync_reset_pipeline(connection, pool)
+
+        pipeline.reset()
+
+        assert connection.lease.phase is redis.LeasePhase.COMPLETED
+        assert connection.is_connected is True
+        assert connection.disconnect_count == 0
+        pool.release.assert_called_once_with(connection)
+        assert pipeline.connection is None
+        assert pipeline.watching is False
+
+    def test_reset_unwatch_connection_error_dirty(self):
+        pool = mock.MagicMock()
+        connection = _SyncResetStubConnection(
+            read_error=redis.exceptions.ConnectionError("simulated read failure")
+        )
+        connection.lease.begin()
+        pipeline = _make_sync_reset_pipeline(connection, pool)
+
+        pipeline.reset()
+
+        assert connection.lease.phase is redis.LeasePhase.ABORTED_DIRTY
+        assert connection.is_connected is False
+        assert connection.disconnect_count == 1
+        pool.release.assert_called_once_with(connection)
+
+    def test_reset_non_watching_preserves_existing_terminal(self):
+        pool = mock.MagicMock()
+        connection = _SyncResetStubConnection()
+        connection.lease.begin()
+        connection.lease.mark_write_inflight()
+        connection.lease.mark_await_read()
+        connection.lease.mark_completed()
+        pipeline = _make_sync_reset_pipeline(connection, pool)
+        pipeline.watching = False
+
+        pipeline.reset()
+
+        assert connection.lease.phase is redis.LeasePhase.COMPLETED
+        assert connection.is_connected is True
+        pool.release.assert_called_once_with(connection)

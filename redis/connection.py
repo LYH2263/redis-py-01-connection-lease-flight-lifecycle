@@ -38,6 +38,7 @@ from ._defaults import (
     DEFAULT_SOCKET_TIMEOUT,
     get_default_socket_keepalive_options,
 )
+from ._lease import ConnectionLease
 from ._parsers import BaseParser, Encoder, _HiredisParser, _RESP2Parser, _RESP3Parser
 from .auth.token import TokenInterface
 from .backoff import NoBackoff
@@ -875,6 +876,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         else:
             self._event_dispatcher = event_dispatcher
         self.pid = os.getpid()
+        # Observable state of the current acquire/send/read/release lease.
+        # One lease object per connection for its whole lifetime.
+        self._lease = ConnectionLease()
         self.db = db
         self.client_name = client_name
 
@@ -1305,6 +1309,16 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             # notifications and skipped end maint notifications
             self.reset_received_notifications()
 
+    @property
+    def lease(self) -> "ConnectionLease":
+        """The current connection lease.
+
+        Read-only observable lifecycle state (phase transitions) for the
+        latest checkout/send/read/release cycle of this connection. The
+        lease object is never replaced for the lifetime of the connection.
+        """
+        return self._lease
+
     def mark_for_reconnect(self):
         self._should_reconnect = True
 
@@ -1337,6 +1351,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
 
     def send_packed_command(self, command, check_health=True):
         """Send an already packed command to the Redis server"""
+        # Lease phase: command is about to be written. For pool-less
+        # direct connection usage this lazily begins the lease.
+        self._lease.mark_write_inflight()
         if not self._sock:
             self.connect_check_health(check_health=False)
         # guard against health check recursion
@@ -1399,6 +1416,8 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         push_request=False,
     ):
         """Read the response from a previously sent command"""
+        # Lease phase: a reply is about to be consumed from the socket.
+        self._lease.mark_await_read()
 
         host_error = self._host_error()
 
@@ -1914,6 +1933,11 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
 
     def re_auth(self):
         self._conn.re_auth()
+
+    @property
+    def lease(self) -> "ConnectionLease":
+        # The proxy shares the lease of the real connection it wraps.
+        return self._conn.lease
 
     def mark_for_reconnect(self):
         self._conn.mark_for_reconnect()
@@ -3252,6 +3276,9 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                 connection = self.make_connection()
                 is_created = True
             self._in_use_connections.add(connection)
+            # New lease starts at checkout. Terminal phases of the previous
+            # lease stay observable until this point.
+            connection.lease.begin()
 
         # Record state transition: IDLE -> USED
         # (make_connection already recorded IDLE +1 for new connections)
@@ -3292,6 +3319,9 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                 ):
                     raise ConnectionError("Connection not ready")
         except BaseException:
+            # Checkout failed before any command reply was read; the
+            # connection must reconnect before it can serve again.
+            connection.lease.mark_aborted_dirty()
             # release the connection back to the pool so that we don't
             # leak it
             self.release(connection)
@@ -3351,7 +3381,10 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
                 return
 
             if self.owns_connection(connection):
-                if connection.should_reconnect():
+                # Double guard: a lease explicitly terminated dirty must
+                # never be handed out on its old (possibly half-read)
+                # socket. disconnect() makes the next checkout reconnect.
+                if connection.should_reconnect() or connection.lease.is_dirty:
                     connection.disconnect()
                 self._available_connections.append(connection)
                 self._event_dispatcher.dispatch(
@@ -3712,6 +3745,10 @@ class BlockingConnectionPool(ConnectionPool):
                     pass
                 self._locked = False
 
+        # New lease starts at checkout. Terminal phases of the previous
+        # lease stay observable until this point.
+        connection.lease.begin()
+
         # Record state transition: IDLE -> USED
         # (make_connection already recorded IDLE +1 for new connections)
         # This ensures counters stay balanced if connect() fails and release() is called
@@ -3751,6 +3788,9 @@ class BlockingConnectionPool(ConnectionPool):
                 ):
                     raise ConnectionError("Connection not ready")
         except BaseException:
+            # Checkout failed before any command reply was read; the
+            # connection must reconnect before it can serve again.
+            connection.lease.mark_aborted_dirty()
             # release the connection back to the pool so that we don't leak it
             self.release(connection)
             raise
@@ -3791,7 +3831,10 @@ class BlockingConnectionPool(ConnectionPool):
                     counter=-1,
                 )
                 return
-            if connection.should_reconnect():
+            # Double guard: a lease explicitly terminated dirty must
+            # never be handed out on its old (possibly half-read) socket.
+            # disconnect() makes the next checkout reconnect.
+            if connection.should_reconnect() or connection.lease.is_dirty:
                 connection.disconnect()
             # Put the connection back into the pool.
             pool_name = get_pool_name(self)

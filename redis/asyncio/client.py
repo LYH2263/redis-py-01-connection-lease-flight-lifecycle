@@ -927,6 +927,11 @@ class Redis(
         pool = self.connection_pool
         command_name = args[0]
         conn = self.connection or await pool.get_connection()
+        if self.connection:
+            # A pinned connection (single_connection_client) is not checked
+            # out per command, so each command on it starts its own lease
+            # flight. Pooled connections were already begun at checkout.
+            conn.lease.begin()
 
         # Start timing for observability
         start_time = time.monotonic()
@@ -958,8 +963,19 @@ class Redis(
                 server_port=getattr(conn, "port", None),
                 db_namespace=str(conn.db),
             )
+            conn.lease.mark_completed()
             return result
         except Exception as e:
+            # This exit's own terminal verdict: a server-side error reply
+            # is a fully consumed reply (clean, reusable); every other
+            # exception before/while reading terminates the lease dirty.
+            # NOTE: asyncio.CancelledError (BaseException) is intentionally
+            # not handled here -- single-command cancellation keeps its
+            # existing semantics (see issue #2665).
+            if isinstance(e, ResponseError):
+                conn.lease.mark_completed()
+            else:
+                conn.lease.mark_aborted_dirty()
             await record_error_count(
                 server_address=getattr(conn, "host", None),
                 server_port=getattr(conn, "port", None),
@@ -1860,13 +1876,24 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                 except ConnectionError:
                     # disconnect will also remove any previous WATCHes
                     if self.connection:
+                        # Dirty exit (the UNWATCH reply may be unread):
+                        # terminal phase first, then clear the socket.
+                        self.connection.lease.mark_aborted_dirty()
                         await self.connection.disconnect()
                 except asyncio.CancelledError:
                     # Disconnect so any unread UNWATCH reply does not get
                     # served to the next caller that takes the connection.
                     if self.connection:
+                        # Cancellation with a possibly unread reply:
+                        # dirty terminal phase before the disconnect.
+                        self.connection.lease.mark_aborted_dirty()
                         await self.connection.disconnect()
                     raise
+                else:
+                    # UNWATCH reply fully consumed: the held watching lease
+                    # ends cleanly; the existing lazy-reconnect check in
+                    # pool.release still applies.
+                    self.connection.lease.mark_completed()
         finally:
             self.watching = False
             self.explicit_transaction = False
@@ -1992,6 +2019,12 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
 
             return response
         except Exception as e:
+            # A ResponseError is a fully consumed reply and the pinned
+            # watching session may continue. Any other escaping failure
+            # leaves the held lease dirty until reset() returns the
+            # connection; the failure callback already disconnected it.
+            if not isinstance(e, ResponseError):
+                conn.lease.mark_aborted_dirty()
             await record_error_count(
                 server_address=getattr(conn, "host", None),
                 server_port=getattr(conn, "port", None),
@@ -2272,8 +2305,28 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
                 server_port=getattr(conn, "port", None),
                 db_namespace=str(conn.db),
             )
+            # Every batched reply (including captured per-command
+            # ResponseErrors) has been consumed: the lease ends cleanly.
+            conn.lease.mark_completed()
             return response
+        except asyncio.CancelledError:
+            # Cancellation may land mid-write or between replies. reset()
+            # below clears a possibly half-read UNWATCH when watching; mark
+            # the terminal only if the batch flight is still active (the
+            # failure callback's nested reset may already have closed it).
+            if conn.lease.is_active:
+                conn.lease.mark_aborted_dirty()
+            raise
         except Exception as e:
+            # This pipeline exit's own terminal verdict: server-side error
+            # replies (including an EXEC nil reported as WatchError) come
+            # from fully consumed reply streams and end cleanly; every
+            # other failure (transport error mid-batch, request encoding
+            # before the single batch write, ...) terminates dirty.
+            if isinstance(e, (ResponseError, WatchError)):
+                conn.lease.mark_completed()
+            else:
+                conn.lease.mark_aborted_dirty()
             await record_error_count(
                 server_address=getattr(conn, "host", None),
                 server_port=getattr(conn, "port", None),

@@ -9,6 +9,7 @@ class DummyConnection(ConnectionInterface):
 
     def __init__(self, *args, **kwargs):
         self.connected = False
+        self.lease = redis.ConnectionLease()
 
     @property
     def is_connected(self) -> bool:

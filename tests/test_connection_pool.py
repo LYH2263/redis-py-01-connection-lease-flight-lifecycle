@@ -54,6 +54,7 @@ class DummyConnection:
         self.kwargs = kwargs
         self.pid = os.getpid()
         self._sock = None
+        self.lease = redis.ConnectionLease()
 
     def connect(self):
         self._sock = mock.Mock()
@@ -1336,3 +1337,43 @@ class TestConnectionPoolReleasedEventEmission:
 
         # Event should NOT be emitted for foreign connection
         listener.listen.assert_not_called()
+
+
+class TestLeaseConcurrencyIsolation:
+    """Two simultaneously leased connections must keep independent lease
+    flights: the dirty terminal of one must never affect the other."""
+
+    def test_two_concurrent_leases_do_not_interfere(self):
+        pool = redis.ConnectionPool(connection_class=DummyConnection, max_connections=2)
+
+        conn_a = pool.get_connection()
+        conn_b = pool.get_connection()
+        assert conn_a.lease is not conn_b.lease
+        assert conn_a.lease.phase is redis.LeasePhase.LEASED
+        assert conn_b.lease.phase is redis.LeasePhase.LEASED
+        assert len(pool._in_use_connections) == 2
+
+        # A flies and completes successfully; B fails on the write side.
+        conn_a.lease.mark_write_inflight()
+        conn_a.lease.mark_await_read()
+        conn_a.lease.mark_completed()
+        conn_b.lease.mark_write_inflight()
+        conn_b.lease.mark_aborted_dirty()
+
+        # Return the dirty one first, then the clean one.
+        pool.release(conn_b)
+        pool.release(conn_a)
+
+        assert len(pool._in_use_connections) == 0
+        assert len(pool._available_connections) == 2
+        # B was disconnected by the dirty double guard; A stays live.
+        assert conn_b._sock is None
+        assert conn_a._sock is not None
+        assert conn_b.lease.phase is redis.LeasePhase.ABORTED_DIRTY
+        assert conn_a.lease.phase is redis.LeasePhase.COMPLETED
+
+        # Both slots are reusable; a fresh checkout re-arms each lease.
+        checked_out = [pool.get_connection(), pool.get_connection()]
+        for conn in checked_out:
+            assert conn.lease.phase is redis.LeasePhase.LEASED
+        assert set(checked_out) == {conn_a, conn_b}

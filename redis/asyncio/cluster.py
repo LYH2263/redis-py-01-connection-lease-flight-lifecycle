@@ -1714,7 +1714,7 @@ class ClusterNode:
 
     def acquire_connection(self) -> Connection:
         try:
-            return self._free.popleft()
+            connection = self._free.popleft()
         except IndexError:
             if len(self._connections) < self.max_connections:
                 # We are configuring the connection pool not to retry
@@ -1735,26 +1735,38 @@ class ClusterNode:
                 connection_kwargs["retry"] = retry
                 connection = self.connection_class(**connection_kwargs)
                 self._connections.append(connection)
-                return connection
+            else:
+                raise MaxConnectionsError()
 
-            raise MaxConnectionsError()
+        # New lease starts at checkout. The terminal phase of the previous
+        # lease (observable on the connection after its release) is replaced.
+        connection.lease.begin()
+        return connection
 
     async def disconnect_if_needed(self, connection: Connection) -> None:
         """
-        Disconnect a connection if it's marked for reconnect.
+        Disconnect a connection if it's marked for reconnect or its current
+        lease terminated dirty.
+
         This implements lazy disconnection to avoid race conditions.
         The connection will auto-reconnect on next use.
         """
-        if connection.should_reconnect():
+        if connection.should_reconnect() or connection.lease.is_dirty:
             await connection.disconnect()
 
     def release(self, connection: Connection) -> None:
         """
         Release connection back to free queue.
         If the connection is marked for reconnect, disconnect it before
-        returning it to the free queue.
+        returning it to the free queue. A lease that terminated dirty must
+        not re-enter the free queue while still connected: the exits
+        normally disconnect it through ``disconnect_if_needed`` first; the
+        ``is_connected`` check below is the second guard for callers that
+        release directly.
         """
-        if connection.should_reconnect():
+        if connection.should_reconnect() or (
+            connection.lease.is_dirty and connection.is_connected
+        ):
             task = asyncio.create_task(self._disconnect_and_release(connection))
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
@@ -1877,13 +1889,34 @@ class ClusterNode:
             # Execute command
             await connection.send_packed_command(connection.pack_command(*args))
 
-            # Read response
-            return await self.parse_response(connection, args[0], **kwargs)
+            # Read response. Mark the lease complete as soon as the reply
+            # has been fully consumed (an explicit statement rather than a
+            # try/else: a return inside try skips the else clause).
+            response = await self.parse_response(connection, args[0], **kwargs)
+            connection.lease.mark_completed()
+            return response
+        except ResponseError:
+            # A server-side error reply is a fully consumed reply: the
+            # socket holds no unread bytes, the lease ends cleanly and the
+            # connection stays reusable.
+            connection.lease.mark_completed()
+            raise
+        except BaseException:
+            # Anything else between acquire and a fully consumed reply
+            # (argument encoding failure before the write, write-side
+            # failure, connection-level read failure, cancellation) may
+            # leave a half-written/half-read socket: terminate the lease
+            # dirty and force the reconnect path in addition to the lease
+            # double guard in disconnect_if_needed()/release().
+            connection.lease.mark_aborted_dirty()
+            connection.mark_for_reconnect()
+            raise
         finally:
             try:
                 await self.disconnect_if_needed(connection)
             finally:
-                # Release connection
+                # Release connection. This synchronous section contains no
+                # await, so a second CancelledError cannot skip the return.
                 self.release(connection)
 
     async def _himport_reconcile_discards(self, conn: "Connection") -> None:
@@ -1939,7 +1972,9 @@ class ClusterNode:
                 connection.pack_commands(cmd.args for cmd in commands)
             )
 
-            # Read responses
+            # Read responses. Connection-level errors of a single reply are
+            # captured into cmd.result (historical behaviour): the batch
+            # result carries them instead of aborting the read loop.
             ret = False
             for cmd in commands:
                 try:
@@ -1950,12 +1985,36 @@ class ClusterNode:
                     cmd.result = e
                     ret = True
 
+            # This exit's own terminal verdict (kept separate from
+            # execute_command's single-reply verdict): the reply stream is
+            # broken if a connection-level error was captured as a command
+            # result -- the remaining replies can no longer be aligned --
+            # or if the connection was marked for reconnect. A captured
+            # ResponseError is a complete server reply and stays clean.
+            stream_errors = (ConnectionError, TimeoutError, OSError)
+            if connection.should_reconnect() or any(
+                isinstance(getattr(cmd, "result", None), stream_errors)
+                for cmd in commands
+            ):
+                connection.lease.mark_aborted_dirty()
+                connection.mark_for_reconnect()
+            else:
+                connection.lease.mark_completed()
+
             return ret
+        except BaseException:
+            # Write-stage failures (HIMPORT PREPARE, pack_commands argument
+            # encoding, the single batch send) or a cancellation escaping
+            # the per-command except leave a half-written/half-read socket.
+            connection.lease.mark_aborted_dirty()
+            connection.mark_for_reconnect()
+            raise
         finally:
             try:
                 await self.disconnect_if_needed(connection)
             finally:
-                # Release connection
+                # Release connection. This synchronous section contains no
+                # await, so a second CancelledError cannot skip the return.
                 self.release(connection)
 
     async def re_auth_callback(self, token: TokenInterface):
@@ -3274,9 +3333,13 @@ class TransactionStrategy(AbstractStrategy):
             or type(error) in self.CONNECTION_ERRORS
         ):
             if self._transaction_connection and self._transaction_node:
-                # Disconnect and release back to pool
-                await self._transaction_connection.disconnect()
-                self._transaction_node.release(self._transaction_connection)
+                # Disconnect and release back to pool. A connection/slot
+                # error at this point may have left replies unread, so the
+                # held lease terminates dirty before the disconnect.
+                dirty_connection = self._transaction_connection
+                dirty_connection.lease.mark_aborted_dirty()
+                await dirty_connection.disconnect()
+                self._transaction_node.release(dirty_connection)
                 self._transaction_connection = None
 
             self._pipe.cluster_client.reinitialize_counter += 1
@@ -3478,15 +3541,23 @@ class TransactionStrategy(AbstractStrategy):
                 except self.CONNECTION_ERRORS:
                     # disconnect will also remove any previous WATCHes
                     if self._transaction_connection:
+                        # Dirty exit (UNWATCH reply may be unread): terminal
+                        # phase + explicit disconnect stay in this branch.
+                        self._transaction_connection.lease.mark_aborted_dirty()
                         await self._transaction_connection.disconnect()
                 except asyncio.CancelledError:
                     # Disconnect so any unread UNWATCH reply does not get
                     # served to the next caller that takes the connection.
                     if self._transaction_connection:
+                        # Cancellation with a possibly unread reply: dirty
+                        # terminal phase before the disconnect.
+                        self._transaction_connection.lease.mark_aborted_dirty()
                         await self._transaction_connection.disconnect()
                     raise
                 else:
-                    # On the happy path, honor lazy reconnect before release.
+                    # UNWATCH reply fully consumed: the held transaction
+                    # lease ends cleanly; honor lazy reconnect before release.
+                    self._transaction_connection.lease.mark_completed()
                     await self._transaction_node.disconnect_if_needed(
                         self._transaction_connection
                     )
@@ -3577,6 +3648,7 @@ class _ClusterNodePoolAdapter(ConnectionPoolInterface):
             # is established but before AUTH/HELLO completes) leaving the
             # connection in a partially-connected state.  Disconnect before
             # returning it to the node's free queue so it is not reused.
+            connection.lease.mark_aborted_dirty()
             await connection.disconnect()
             self._node.release(connection)
             raise

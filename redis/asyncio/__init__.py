@@ -19,6 +19,7 @@ from redis.asyncio.sentinel import (
     SentinelManagedSSLConnection,
 )
 from redis.asyncio.utils import from_url
+from redis._lease import ConnectionLease, LeasePhase
 from redis.backoff import default_backoff
 from redis.exceptions import (
     AuthenticationError,
@@ -47,6 +48,8 @@ __all__ = [
     "BlockingConnectionPool",
     "BusyLoadingError",
     "ChildDeadlockedError",
+    "ConnectionLease",
+    "LeasePhase",
     "Connection",
     "ConnectionError",
     "ConnectionPool",

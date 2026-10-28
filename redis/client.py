@@ -871,6 +871,11 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         pool = self.connection_pool
         command_name = args[0]
         conn = self.connection or pool.get_connection()
+        if self.connection:
+            # A pinned connection (single_connection_client) is not checked
+            # out per command, so each command on it starts its own lease
+            # flight. Pooled connections were already begun at checkout.
+            conn.lease.begin()
 
         # Start timing for observability
         start_time = time.monotonic()
@@ -901,8 +906,17 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
                 server_port=getattr(conn, "port", None),
                 db_namespace=str(conn.db),
             )
+            conn.lease.mark_completed()
             return result
         except Exception as e:
+            # This exit's own terminal verdict: a server-side error reply
+            # is a fully consumed reply (clean, reusable); every other
+            # exception before/while reading terminates the lease dirty.
+            # Sync code has no cancellation, so there is no cancel branch.
+            if isinstance(e, ResponseError):
+                conn.lease.mark_completed()
+            else:
+                conn.lease.mark_aborted_dirty()
             record_error_count(
                 server_address=getattr(conn, "host", None),
                 server_port=getattr(conn, "port", None),
@@ -1863,8 +1877,15 @@ class Pipeline(Redis):
                 self.connection.send_command("UNWATCH")
                 self.connection.read_response()
             except ConnectionError:
-                # disconnect will also remove any previous WATCHes
+                # Dirty exit (the UNWATCH reply may be unread): terminal
+                # phase first, then disconnect removes any previous WATCHes.
+                self.connection.lease.mark_aborted_dirty()
                 self.connection.disconnect()
+            else:
+                # UNWATCH reply fully consumed: the held watching lease
+                # ends cleanly; the pool release still honors the
+                # should_reconnect lazy-disconnect rule.
+                self.connection.lease.mark_completed()
         # clean up the other instance attributes
         self.watching = False
         self.explicit_transaction = False
@@ -1982,6 +2003,12 @@ class Pipeline(Redis):
 
             return response
         except Exception as e:
+            # A ResponseError is a fully consumed reply and the pinned
+            # watching session may continue. Any other escaping failure
+            # leaves the held lease dirty until reset() returns the
+            # connection; the failure callback already disconnected it.
+            if not isinstance(e, ResponseError):
+                conn.lease.mark_aborted_dirty()
             record_error_count(
                 server_address=getattr(conn, "host", None),
                 server_port=getattr(conn, "port", None),
@@ -2243,8 +2270,21 @@ class Pipeline(Redis):
                 server_port=getattr(conn, "port", None),
                 db_namespace=str(conn.db),
             )
+            # Every batched reply (including captured per-command
+            # ResponseErrors) has been consumed: the lease ends cleanly.
+            conn.lease.mark_completed()
             return response
         except Exception as e:
+            # This pipeline exit's own terminal verdict: server-side error
+            # replies (including an EXEC nil reported as WatchError) come
+            # from fully consumed reply streams and end cleanly; every
+            # other failure (transport error mid-batch, request encoding
+            # before the single batch write, ...) terminates dirty. Sync
+            # code has no cancellation, so there is no cancel branch.
+            if isinstance(e, (ResponseError, WatchError)):
+                conn.lease.mark_completed()
+            else:
+                conn.lease.mark_aborted_dirty()
             record_error_count(
                 server_address=getattr(conn, "host", None),
                 server_port=getattr(conn, "port", None),

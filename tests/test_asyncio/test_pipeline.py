@@ -125,6 +125,10 @@ class TestPipeline:
 
         assert pipe.connection is None
         assert leased not in pool._in_use_connections
+        # Cancellation while the UNWATCH reply may be unread terminates the
+        # lease dirty and the socket is cleared before the slot is returned.
+        assert leased.lease.phase is redis.LeasePhase.ABORTED_DIRTY
+        assert leased.is_connected is False
 
     async def test_exec_error_in_response(self, r):
         """
@@ -812,3 +816,165 @@ class TestAsyncPipelineOperationDurationMetricsRecording:
             self.operation_duration.record.assert_not_called()
 
         async_recorder.reset_collector()
+
+
+class _ResetStubConnection:
+    """Minimal connection surface exercised by async Pipeline.reset()."""
+
+    def __init__(self, *, read_error=None, read_started=None, hold_read=False):
+        self.lease = redis.ConnectionLease()
+        self.is_connected = True
+        self.disconnect_count = 0
+        self._read_error = read_error
+        self._read_started = read_started
+        self._hold_read = hold_read
+
+    def should_reconnect(self):
+        return False
+
+    def mark_for_reconnect(self):
+        pass
+
+    async def disconnect(self, *args, **kwargs):
+        self.disconnect_count += 1
+        self.is_connected = False
+
+    async def send_command(self, *args, **kwargs):
+        self.lease.mark_write_inflight()
+
+    async def read_response(self, *args, **kwargs):
+        self.lease.mark_await_read()
+        if self._read_started is not None:
+            self._read_started.set()
+        if self._hold_read:
+            await asyncio.sleep(60)
+        if self._read_error is not None:
+            raise self._read_error
+        return True
+
+
+class _SlowReleasePool:
+    """Pool stub whose release() is cancellable from the outside only:
+    it records whether the shielded release actually completes."""
+
+    def __init__(self):
+        self.released = []
+        self.release_started = asyncio.Event()
+        self.release_finished = asyncio.Event()
+
+    async def release(self, connection):
+        self.release_started.set()
+        await asyncio.sleep(0.05)
+        self.released.append(connection)
+        self.release_finished.set()
+
+
+def _make_reset_pipeline(connection, pool):
+    pipeline = Pipeline(
+        connection_pool=pool,
+        response_callbacks={},
+        transaction=True,
+        shard_hint=None,
+    )
+    pipeline.connection = connection
+    pipeline.watching = True
+    return pipeline
+
+
+class TestPipelineResetLease:
+    """Offline lease-flight tests for the standalone async Pipeline.reset
+    exit (kept independent from the cluster strategy reset tests)."""
+
+    async def test_reset_unwatch_success_completed_clean(self):
+        pool = MagicMock()
+        pool.release = AsyncMock()
+        connection = _ResetStubConnection()
+        connection.lease.begin()
+        pipeline = _make_reset_pipeline(connection, pool)
+
+        await pipeline.reset()
+
+        assert connection.lease.phase is redis.LeasePhase.COMPLETED
+        assert connection.is_connected is True
+        assert connection.disconnect_count == 0
+        pool.release.assert_awaited_once_with(connection)
+        assert pipeline.connection is None
+        assert pipeline.watching is False
+
+    async def test_reset_unwatch_connection_error_dirty(self):
+        pool = MagicMock()
+        pool.release = AsyncMock()
+        connection = _ResetStubConnection(
+            read_error=redis.exceptions.ConnectionError("simulated read failure")
+        )
+        connection.lease.begin()
+        pipeline = _make_reset_pipeline(connection, pool)
+
+        await pipeline.reset()
+
+        assert connection.lease.phase is redis.LeasePhase.ABORTED_DIRTY
+        assert connection.is_connected is False
+        assert connection.disconnect_count == 1
+        pool.release.assert_awaited_once_with(connection)
+
+    async def test_reset_cancelled_during_unwatch_read_dirty(self):
+        pool = MagicMock()
+        pool.release = AsyncMock()
+        read_started = asyncio.Event()
+        connection = _ResetStubConnection(read_started=read_started, hold_read=True)
+        connection.lease.begin()
+        pipeline = _make_reset_pipeline(connection, pool)
+
+        task = asyncio.ensure_future(pipeline.reset())
+        await read_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert connection.lease.phase is redis.LeasePhase.ABORTED_DIRTY
+        assert connection.is_connected is False
+        assert connection.disconnect_count == 1
+        pool.release.assert_awaited_once_with(connection)
+
+    async def test_reset_release_survives_second_cancellation(self):
+        # The release itself is shielded: a second cancel delivered while
+        # reset() awaits pool.release() must not lose the slot.
+        pool = _SlowReleasePool()
+        read_started = asyncio.Event()
+        connection = _ResetStubConnection(read_started=read_started, hold_read=True)
+        connection.lease.begin()
+        pipeline = _make_reset_pipeline(connection, pool)
+
+        task = asyncio.ensure_future(pipeline.reset())
+        await read_started.wait()
+        task.cancel()  # first cancel: aborts the UNWATCH read
+        # Wait until the finally has entered the shielded release, then
+        # cancel a second time while the release await is in flight.
+        await pool.release_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The shielded release still runs to completion; the slot is not
+        # leaked even though two cancellations hit the reset.
+        await asyncio.wait_for(pool.release_finished.wait(), timeout=1)
+        assert pool.released == [connection]
+
+    async def test_reset_non_watching_preserves_existing_terminal(self):
+        # A non-watching reset performs no UNWATCH round trip: the terminal
+        # decided by the preceding pipeline execute() must survive release.
+        pool = MagicMock()
+        pool.release = AsyncMock()
+        connection = _ResetStubConnection()
+        connection.lease.begin()
+        connection.lease.mark_write_inflight()
+        connection.lease.mark_await_read()
+        connection.lease.mark_completed()
+        pipeline = _make_reset_pipeline(connection, pool)
+        pipeline.watching = False
+
+        await pipeline.reset()
+
+        assert connection.lease.phase is redis.LeasePhase.COMPLETED
+        assert connection.is_connected is True
+        pool.release.assert_awaited_once_with(connection)

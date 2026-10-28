@@ -48,6 +48,7 @@ else:
     SSLContext = None
     VerifyFlags = None
 
+from .._lease import ConnectionLease
 from ..auth.token import TokenInterface
 from ..driver_info import DriverInfo, resolve_driver_info
 from ..event import AsyncAfterConnectionReleasedEvent, EventDispatcher
@@ -575,6 +576,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         "_buffer_cutoff",
         "_lock",
         "_socket_read_size",
+        "_lease",
         "__dict__",
     )
 
@@ -692,6 +694,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         self._buffer_cutoff = 6000
         self._re_auth_token: Optional[TokenInterface] = None
         self._should_reconnect = False
+        # Observable state of the current acquire/send/read/release lease.
+        # One lease object per connection for its whole lifetime.
+        self._lease = ConnectionLease()
 
         try:
             p = int(protocol)
@@ -902,6 +907,16 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             task = callback(self)
             if task and inspect.isawaitable(task):
                 await task
+
+    @property
+    def lease(self) -> "ConnectionLease":
+        """The current connection lease.
+
+        Read-only observable lifecycle state (phase transitions) for the
+        latest checkout/send/read/release cycle of this connection. The
+        lease object is never replaced for the lifetime of the connection.
+        """
+        return self._lease
 
     def mark_for_reconnect(self):
         self._should_reconnect = True
@@ -1171,6 +1186,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
     async def send_packed_command(
         self, command: Union[bytes, str, Iterable[bytes]], check_health: bool = True
     ) -> None:
+        # Lease phase: command is about to be written. For pool-less
+        # direct connection usage this lazily begins the lease.
+        self._lease.mark_write_inflight()
         if not self.is_connected:
             await self.connect_check_health(check_health=False)
         if check_health:
@@ -1268,6 +1286,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         # TODO(next-major): drop the math.inf branch. Use SENTINEL as the
         # default for ``timeout`` and treat ``timeout is None`` as the
         # "no timeout" signal (matching the PubSub docstring contract).
+        # Lease phase: a reply is about to be consumed from the socket.
+        self._lease.mark_await_read()
+
         # Match only positive infinity here. ``-math.inf`` is not a valid
         # "block forever" signal and historically behaved as an already-
         # expired timeout; preserve that.
@@ -2831,6 +2852,9 @@ class ConnectionPool(
 
             return connection
         except BaseException:
+            # Checkout failed before any command reply was read; the
+            # connection must reconnect before it can serve again.
+            connection.lease.mark_aborted_dirty()
             await self.release(connection)
             raise
 
@@ -2843,6 +2867,9 @@ class ConnectionPool(
                 raise MaxConnectionsError("Too many connections") from None
             connection = self.make_connection()
         self._in_use_connections.add(connection)
+        # New lease starts at checkout. Terminal phases of the previous
+        # lease stay observable until this point.
+        connection.lease.begin()
         return connection
 
     def get_encoder(self):
@@ -2883,7 +2910,10 @@ class ConnectionPool(
         async with self._lock:
             self._in_use_connections.remove(connection)
 
-            if connection.should_reconnect():
+            # Double guard: a lease explicitly terminated dirty must never
+            # be handed out on its old (possibly half-read) socket.
+            # disconnect() makes the next checkout reconnect.
+            if connection.should_reconnect() or connection.lease.is_dirty:
                 await connection.disconnect()
 
             self._available_connections.append(connection)
@@ -3115,6 +3145,9 @@ class BlockingConnectionPool(ConnectionPool):
 
             return connection
         except BaseException:
+            # Checkout failed before any command reply was read; the
+            # connection must reconnect before it can serve again.
+            connection.lease.mark_aborted_dirty()
             await self.release(connection)
             raise
 

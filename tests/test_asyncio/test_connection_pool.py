@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 import pytest_asyncio
 import redis.asyncio as redis
+from redis._lease import ConnectionLease
 from redis.asyncio.connection import (
     BlockingConnectionPool,
     Connection,
@@ -113,6 +114,8 @@ class DummyConnection(Connection):
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self._connected = False
+        # Mirrors AbstractConnection.__init__ (not called here).
+        self._lease = ConnectionLease()
 
     def repr_pieces(self):
         return [("id", id(self)), ("kwargs", self.kwargs)]

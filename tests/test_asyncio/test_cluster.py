@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 import pytest
 import pytest_asyncio
 from _pytest.fixtures import FixtureRequest
+from redis._lease import ConnectionLease, LeasePhase
 from redis._parsers import AsyncCommandsParser
 from redis.asyncio.cluster import (
     ClusterNode,
@@ -3404,9 +3405,13 @@ class TestClusterNodeConnectionHandling:
             self.db = kwargs.get("db", 0)
             self.is_connected = False
             self.send_count = 0
+            self.lease = ConnectionLease()
 
         def should_reconnect(self) -> bool:
             return False
+
+        def mark_for_reconnect(self) -> None:
+            self.is_connected = False
 
         async def disconnect(self) -> None:
             self.is_connected = False
@@ -3599,6 +3604,7 @@ class TestClusterNodeConnectionHandling:
             def __init__(self) -> None:
                 self.disconnect_called = False
                 self.is_connected = True
+                self.lease = ConnectionLease()
 
             def should_reconnect(self) -> bool:
                 return True
@@ -3631,6 +3637,7 @@ class TestClusterNodeConnectionHandling:
             def __init__(self) -> None:
                 self.disconnect_called = False
                 self.is_connected = False
+                self.lease = ConnectionLease()
 
             def should_reconnect(self) -> bool:
                 return False
@@ -3656,6 +3663,9 @@ class TestClusterNodeConnectionHandling:
         """
 
         class FakeConnection:
+            def __init__(self) -> None:
+                self.lease = ConnectionLease()
+
             def should_reconnect(self) -> bool:
                 return True
 
@@ -3694,6 +3704,7 @@ class TestClusterNodeConnectionHandling:
         # Create a mock connection marked for reconnect
         conn = mock.AsyncMock(spec=Connection)
         conn.should_reconnect.return_value = True
+        conn.lease = ConnectionLease()
 
         # disconnect_if_needed should disconnect the connection
         await node.disconnect_if_needed(conn)
@@ -3709,11 +3720,416 @@ class TestClusterNodeConnectionHandling:
         # Create a mock connection NOT marked for reconnect
         conn = mock.AsyncMock(spec=Connection)
         conn.should_reconnect.return_value = False
+        # A MagicMock lease would report a truthy is_dirty; the real lease
+        # object keeps the double guard inactive for clean connections.
+        conn.lease = ConnectionLease()
 
         # disconnect_if_needed should not disconnect
         await node.disconnect_if_needed(conn)
 
         conn.disconnect.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # Connection lease flight lifecycle (AC-5/AC-6/AC-9, cluster exits)
+    # ------------------------------------------------------------------
+
+    class FakeSuccessfulConnection:
+        def __init__(self, **kwargs: Any) -> None:
+            self.host = kwargs["host"]
+            self.port = kwargs["port"]
+            self.db = kwargs.get("db", 0)
+            self.is_connected = True
+            self.disconnect_count = 0
+            self._should_reconnect = False
+            self.lease = ConnectionLease()
+
+        def should_reconnect(self) -> bool:
+            return self._should_reconnect
+
+        def mark_for_reconnect(self) -> None:
+            self._should_reconnect = True
+
+        async def disconnect(self) -> None:
+            self.disconnect_count += 1
+            self.is_connected = False
+            self._should_reconnect = False
+
+        def pack_command(self, *args: Any) -> bytes:
+            return b"packed-command"
+
+        def pack_commands(self, commands: Any) -> List[bytes]:
+            list(commands)
+            return [b"packed-commands"]
+
+        async def send_packed_command(self, command: Any) -> None:
+            self.lease.mark_write_inflight()
+
+        async def read_response(self, *args: Any, **kwargs: Any) -> Any:
+            self.lease.mark_await_read()
+            return b"OK"
+
+    class FakeReadFailingConnection(FakeSuccessfulConnection):
+        def __init__(self, fail_after: int = 0, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._good_replies = fail_after
+
+        async def read_response(self, *args: Any, **kwargs: Any) -> Any:
+            self.lease.mark_await_read()
+            if self._good_replies > 0:
+                self._good_replies -= 1
+                return b"OK"
+            raise ConnectionError("simulated read failure")
+
+    class FakeResponseErrorConnection(FakeSuccessfulConnection):
+        async def read_response(self, *args: Any, **kwargs: Any) -> Any:
+            self.lease.mark_await_read()
+            raise ResponseError("simulated server error")
+
+    class FakePackFailingConnection(FakeSuccessfulConnection):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.send_count = 0
+
+        def pack_command(self, *args: Any) -> bytes:
+            raise DataError("simulated encoding failure")
+
+        def pack_commands(self, commands: Any) -> List[bytes]:
+            list(commands)
+            raise DataError("simulated encoding failure")
+
+        async def send_packed_command(self, command: Any) -> None:
+            self.send_count += 1
+
+    class FakeCancelledWriteConnection(FakeSuccessfulConnection):
+        async def send_packed_command(self, command: Any) -> None:
+            self.lease.mark_write_inflight()
+            raise asyncio.CancelledError()
+
+    def _make_node(self, connection_class: type) -> ClusterNode:
+        return ClusterNode(
+            default_host,
+            7000,
+            max_connections=2,
+            connection_class=connection_class,
+        )
+
+    async def test_acquire_begins_lease_and_rearms_terminal_phase(self) -> None:
+        node = self._make_node(self.FakeSuccessfulConnection)
+
+        connection = node.acquire_connection()
+        assert connection.lease.phase is LeasePhase.LEASED
+        connection.lease.mark_write_inflight()
+        connection.lease.mark_await_read()
+        connection.lease.mark_completed()
+        node.release(connection)
+
+        # Terminal phase stays observable after release ...
+        assert connection in node._free
+        assert connection.lease.phase is LeasePhase.COMPLETED
+
+        # ... until the next checkout starts a new lease.
+        reacquired = node.acquire_connection()
+        assert reacquired is connection
+        assert reacquired.lease.phase is LeasePhase.LEASED
+
+    async def test_execute_command_success_lease_completed_and_reusable(self) -> None:
+        node = self._make_node(self.FakeSuccessfulConnection)
+
+        response = await node.execute_command("GET", "key")
+        assert response == b"OK"
+
+        connection = node._free[0]
+        assert connection.lease.phase is LeasePhase.COMPLETED
+        assert connection.is_connected is True
+        assert connection.disconnect_count == 0
+
+        # Same connection serves the next command without reconnecting.
+        response = await node.execute_command("GET", "key")
+        assert response == b"OK"
+        assert node._free[0] is connection
+        assert connection.is_connected is True
+        assert connection.disconnect_count == 0
+
+    async def test_execute_command_response_error_is_clean_lease(self) -> None:
+        node = self._make_node(self.FakeResponseErrorConnection)
+
+        with pytest.raises(ResponseError, match="simulated server error"):
+            await node.execute_command("GET", "key")
+
+        connection = node._free[0]
+        # A ResponseError is a fully consumed reply: clean, connected, reusable.
+        assert connection.lease.phase is LeasePhase.COMPLETED
+        assert connection.is_connected is True
+        assert connection.disconnect_count == 0
+
+    async def test_execute_command_read_connection_error_dirty(self) -> None:
+        node = self._make_node(self.FakeReadFailingConnection)
+
+        with pytest.raises(ConnectionError, match="simulated read failure"):
+            await node.execute_command("GET", "key")
+
+        connection = node._free[0]
+        assert connection.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert connection.is_connected is False
+        assert connection.disconnect_count == 1
+
+        # The dirty connection is reacquired (slot retained) but its new
+        # lease starts at LEASED and the socket must reconnect before use.
+        reacquired = node.acquire_connection()
+        assert reacquired is connection
+        assert reacquired.lease.phase is LeasePhase.LEASED
+
+    async def test_execute_command_pack_error_dirty_before_write(self) -> None:
+        node = self._make_node(self.FakePackFailingConnection)
+
+        with pytest.raises(DataError, match="simulated encoding failure"):
+            await node.execute_command("GET", "key")
+
+        connection = node._free[0]
+        # Failure happened before any byte was written.
+        assert connection.send_count == 0
+        assert connection.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert connection.is_connected is False
+
+    async def test_repeated_write_failures_return_dirty_slot_without_leak(self) -> None:
+        node = ClusterNode(
+            default_host,
+            7000,
+            max_connections=1,
+            connection_class=self.WriteFailingConnection,
+        )
+
+        connection = None
+        for _ in range(5):
+            with pytest.raises(ConnectionError, match="simulated write failure"):
+                await node.execute_command("GET", "key")
+
+            assert len(node._connections) == 1
+            assert len(node._free) == 1
+            connection = node._free[0]
+            assert connection.lease.phase is LeasePhase.ABORTED_DIRTY
+            assert connection.is_connected is False
+
+        # The same slot/object was returned every single time.
+        assert node._connections[0] is connection
+
+    async def test_execute_command_cancelled_dirty_and_returned(self) -> None:
+        node = self._make_node(self.FakeCancelledWriteConnection)
+
+        with pytest.raises(asyncio.CancelledError):
+            await node.execute_command("GET", "key")
+
+        assert len(node._free) == 1
+        connection = node._free[0]
+        assert connection.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert connection.is_connected is False
+
+    async def test_execute_pipeline_success_completed_clean(self) -> None:
+        node = self._make_node(self.FakeSuccessfulConnection)
+        commands = [
+            PipelineCommand(0, "GET", "key1"),
+            PipelineCommand(1, "GET", "key2"),
+        ]
+
+        ret = await node.execute_pipeline(commands)
+
+        assert ret is False
+        assert [c.result for c in commands] == [b"OK", b"OK"]
+        connection = node._free[0]
+        assert connection.lease.phase is LeasePhase.COMPLETED
+        assert connection.is_connected is True
+        assert connection.disconnect_count == 0
+
+    async def test_execute_pipeline_pack_error_dirty(self) -> None:
+        node = self._make_node(self.FakePackFailingConnection)
+
+        with pytest.raises(DataError, match="simulated encoding failure"):
+            await node.execute_pipeline([PipelineCommand(0, "GET", "key")])
+
+        connection = node._free[0]
+        assert connection.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert connection.is_connected is False
+
+    async def test_execute_pipeline_read_error_midway_dirty(self) -> None:
+        node = ClusterNode(
+            default_host,
+            7000,
+            max_connections=1,
+            # First reply succeeds, every subsequent read raises.
+            connection_class=lambda **kw: self.FakeReadFailingConnection(
+                fail_after=1, **kw
+            ),
+        )
+        commands = [
+            PipelineCommand(0, "GET", "key1"),
+            PipelineCommand(1, "GET", "key2"),
+        ]
+
+        # Per-command connection errors are captured, not raised.
+        ret = await node.execute_pipeline(commands)
+
+        assert ret is True
+        assert commands[0].result == b"OK"
+        assert isinstance(commands[1].result, ConnectionError)
+        connection = node._free[0]
+        assert connection.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert connection.is_connected is False
+
+    async def test_execute_pipeline_response_error_captured_is_clean(self) -> None:
+        node = self._make_node(self.FakeResponseErrorConnection)
+        commands = [PipelineCommand(0, "GET", "key")]
+
+        ret = await node.execute_pipeline(commands)
+
+        assert ret is True
+        assert isinstance(commands[0].result, ResponseError)
+        connection = node._free[0]
+        assert connection.lease.phase is LeasePhase.COMPLETED
+        assert connection.is_connected is True
+        assert connection.disconnect_count == 0
+
+    async def test_execute_pipeline_cancelled_dirty_and_returned(self) -> None:
+        node = self._make_node(self.FakeCancelledWriteConnection)
+
+        with pytest.raises(asyncio.CancelledError):
+            await node.execute_pipeline([PipelineCommand(0, "GET", "key")])
+
+        assert len(node._free) == 1
+        connection = node._free[0]
+        assert connection.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert connection.is_connected is False
+
+    async def test_two_concurrent_leases_do_not_interfere(self) -> None:
+        node = self._make_node(self.FakeSuccessfulConnection)
+
+        conn_a = node.acquire_connection()
+        conn_b = node.acquire_connection()
+        assert conn_a is not conn_b
+        assert conn_a.lease is not conn_b.lease
+
+        # A finishes cleanly while B aborts dirty mid-write.
+        conn_a.lease.mark_write_inflight()
+        conn_a.lease.mark_await_read()
+        conn_a.lease.mark_completed()
+        conn_b.lease.mark_write_inflight()
+        conn_b.lease.mark_aborted_dirty()
+        conn_b.mark_for_reconnect()
+
+        assert conn_a.lease.phase is LeasePhase.COMPLETED
+        assert conn_b.lease.phase is LeasePhase.ABORTED_DIRTY
+        node.release(conn_a)
+        await node.disconnect_if_needed(conn_b)
+        node.release(conn_b)
+
+        assert conn_a in node._free and conn_b in node._free
+        assert conn_a.is_connected is True
+        assert conn_b.is_connected is False
+
+    async def test_concurrent_execute_commands_isolate_dirty_and_clean(
+        self,
+    ) -> None:
+        # Two commands fly concurrently on two connections: both writes are
+        # in flight at the same time, one succeeds and one fails. The dirty
+        # terminal of the failed lease must never bleed into the other.
+        entered = [asyncio.Event(), asyncio.Event()]
+        release_writes = asyncio.Event()
+        index = {"i": 0}
+
+        def factory(**kwargs: Any):
+            i = index["i"]
+            index["i"] += 1
+            conn = self.FakeSuccessfulConnection(**kwargs)
+            conn._interleave_index = i
+
+            async def send_packed_command(command: Any) -> None:
+                conn.lease.mark_write_inflight()
+                entered[i].set()
+                await release_writes.wait()
+                if i == 1:
+                    raise ConnectionError("simulated write failure")
+
+            conn.send_packed_command = send_packed_command
+            return conn
+
+        node = ClusterNode(
+            default_host,
+            7000,
+            max_connections=2,
+            connection_class=factory,
+        )
+
+        task_a = asyncio.ensure_future(node.execute_command("GET", "a"))
+        task_b = asyncio.ensure_future(node.execute_command("GET", "b"))
+        await asyncio.wait_for(
+            asyncio.gather(entered[0].wait(), entered[1].wait()), timeout=1
+        )
+        # Both writes are in flight at the same time: release them.
+        release_writes.set()
+        results = await asyncio.gather(task_a, task_b, return_exceptions=True)
+
+        assert results[0] == b"OK"
+        assert isinstance(results[1], ConnectionError)
+        assert len(node._connections) == 2
+        assert len(node._free) == 2
+
+        phases = {c._interleave_index: c for c in node._free}
+        good = phases[0]
+        bad = phases[1]
+        assert good.lease is not bad.lease
+        assert good.lease.phase is LeasePhase.COMPLETED
+        assert bad.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert good.is_connected is True
+        assert good.disconnect_count == 0
+        assert bad.is_connected is False
+        assert bad.disconnect_count == 1
+
+    async def test_multi_node_pipeline_fanout_isolates_one_dirty_node(
+        self,
+    ) -> None:
+        # Mirrors PipelineStrategy._execute(): the multi-node fan-out is a
+        # gather of per-node execute_pipeline calls. One node fails at the
+        # write stage; the clean node's slot stays connected/reusable and
+        # every node still returns its slot.
+        clean_node = self._make_node(self.FakeSuccessfulConnection)
+        dirty_node = ClusterNode(
+            default_host,
+            7001,
+            max_connections=1,
+            connection_class=self.WriteFailingConnection,
+        )
+        clean_cmds = [PipelineCommand(0, "GET", "k1")]
+        dirty_cmds = [PipelineCommand(1, "GET", "k2")]
+
+        results = await asyncio.gather(
+            clean_node.execute_pipeline(clean_cmds),
+            dirty_node.execute_pipeline(dirty_cmds),
+            return_exceptions=True,
+        )
+
+        assert results[0] is False
+        assert isinstance(results[1], ConnectionError)
+
+        clean_conn = clean_node._free[0]
+        dirty_conn = dirty_node._free[0]
+        assert clean_conn.lease is not dirty_conn.lease
+        assert clean_conn.lease.phase is LeasePhase.COMPLETED
+        assert clean_conn.is_connected is True
+        assert clean_conn.disconnect_count == 0
+        assert dirty_conn.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert dirty_conn.is_connected is False
+        assert len(clean_node._free) == 1
+        assert len(dirty_node._free) == 1
+
+        # Follow-up traffic on both nodes: no cross-talk, no leaked slots.
+        assert (
+            await clean_node.execute_pipeline([PipelineCommand(2, "GET", "k3")])
+            is False
+        )
+        assert clean_node._free[0] is clean_conn
+        assert clean_conn.lease.phase is LeasePhase.COMPLETED
+        reacquired = dirty_node.acquire_connection()
+        assert reacquired is dirty_conn
+        assert reacquired.lease.phase is LeasePhase.LEASED
 
 
 @pytest.mark.fixed_client

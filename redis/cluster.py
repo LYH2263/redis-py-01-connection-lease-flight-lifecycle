@@ -4309,8 +4309,11 @@ class PipelineStrategy(AbstractStrategy):
                     try:
                         connection = get_connection(redis_node)
                     except (ConnectionError, TimeoutError):
-                        # Release any connections we've already acquired before clearing nodes
+                        # Release any connections we've already acquired before clearing nodes.
+                        # None of them was written yet, so their leases end
+                        # cleanly even though checkout of another node failed.
                         for n in nodes.values():
+                            n.connection.lease.mark_completed()
                             n.connection_pool.release(n.connection)
                         # Connection retries are being handled in the node's
                         # Retry object. Reinitialize the node -> slot table.
@@ -4363,6 +4366,18 @@ class PipelineStrategy(AbstractStrategy):
                         node_error = cmd.result
                         break
 
+                # This multi-node exit's own terminal verdict: a transport
+                # error captured into a command result (n.read() stops
+                # reading on ConnectionError/TimeoutError) means remaining
+                # replies are unread -- the node's stream is dirty even
+                # though this node counts as "read" in the offset window.
+                # Captured ResponseErrors are complete server replies and
+                # leave the stream aligned, so the node stays clean.
+                if isinstance(node_error, (ConnectionError, TimeoutError)):
+                    n.connection.lease.mark_aborted_dirty()
+                else:
+                    n.connection.lease.mark_completed()
+
                 record_operation_duration(
                     command_name="PIPELINE",
                     duration_seconds=time.monotonic() - start_time,
@@ -4387,7 +4402,26 @@ class PipelineStrategy(AbstractStrategy):
             # reading / writing to the connections above, which is critical
             # for how we're using the nodes_written/nodes_read offsets.
             for i, n in enumerate(nodes.values()):
-                if i < nodes_written and i >= nodes_read:
+                written_not_read = i < nodes_written and i >= nodes_read
+                if written_not_read:
+                    # Write happened (or was attempted) but the read loop
+                    # never reached/completed this node: half-written /
+                    # half-read replies are possible.
+                    n.connection.lease.mark_aborted_dirty()
+                elif n.connection.lease.is_active:
+                    # Acquired but never flown (e.g. failure during the
+                    # HIMPORT preflight of a later node): end the lease
+                    # cleanly only while the socket is still connected.
+                    # A primitive that disconnected itself mid-preflight
+                    # is dirty and must not be reused.
+                    if n.connection.is_connected:
+                        n.connection.lease.mark_completed()
+                    else:
+                        n.connection.lease.mark_aborted_dirty()
+                # Only dirty nodes are disconnected; clean nodes return to
+                # the pool connected and stay reusable. Every leased slot
+                # is released unconditionally below.
+                if written_not_read or n.connection.lease.is_dirty:
                     n.connection.disconnect()
                 n.connection_pool.release(n.connection)
 

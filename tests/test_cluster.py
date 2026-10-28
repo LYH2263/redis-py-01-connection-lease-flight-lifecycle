@@ -8,12 +8,14 @@ from typing import List
 import warnings
 from queue import LifoQueue, Queue
 from time import monotonic, sleep
-from unittest.mock import DEFAULT, Mock, call, patch
+from unittest.mock import DEFAULT, MagicMock, Mock, call, patch
 
 import pytest
 import redis
 from redis import Redis
+from redis._lease import ConnectionLease, LeasePhase
 from redis._parsers import CommandsParser
+from redis._parsers.commands import CommandPolicies
 from redis.backoff import (
     ExponentialBackoff,
     ExponentialWithJitterBackoff,
@@ -26,6 +28,8 @@ from redis.cluster import (
     ClusterNode,
     LoadBalancingStrategy,
     NodesManager,
+    PipelineCommand,
+    PipelineStrategy,
     RedisCluster,
     get_node_name,
 )
@@ -5126,3 +5130,244 @@ class TestClusterPipelineMetricsRecording:
             duration = call_obj[0][0]
             assert isinstance(duration, float)
             assert duration >= 0
+
+
+class _MultiNodeFakeConnection:
+    def __init__(
+        self,
+        name,
+        *,
+        pack_raises=None,
+        write_raises=None,
+        read_raises=None,
+    ):
+        self.name = name
+        self.host = f"10.0.0.{name}"
+        self.port = 7000 + name
+        self.db = 0
+        self.lease = ConnectionLease()
+        self.is_connected = True
+        self.disconnect_count = 0
+        self._pack_raises = pack_raises
+        self._write_raises = write_raises
+        self._read_raises = read_raises
+
+    def pack_commands(self, args_list):
+        if self._pack_raises is not None:
+            raise self._pack_raises
+        return [b"*1\r\n$4\r\nPING\r\n"]
+
+    def send_packed_command(self, packed):
+        self.lease.mark_write_inflight()
+        if self._write_raises is not None:
+            raise self._write_raises
+
+    def disconnect(self, *args, **kwargs):
+        self.disconnect_count += 1
+        self.is_connected = False
+
+    def parse_response(self, command_name, **options):
+        self.lease.mark_await_read()
+        if self._read_raises is not None:
+            raise self._read_raises
+        return b"OK"
+
+
+class _FakeNode:
+    def __init__(self, name):
+        self.name = f"node-{name}"
+
+
+class _MultiNodeHarness:
+    """Builds a PipelineStrategy wired to three faked cluster nodes."""
+
+    def __init__(self, connections):
+        self.nodes = {name: _FakeNode(name) for name in connections}
+        self.conns = connections
+        self.pools = {}
+        self.redis_nodes = {}
+        self.released = []
+        for name, conn in connections.items():
+            pool = MagicMock()
+
+            def _checkout(conn=conn):
+                # Mirror the real pool: a checkout starts a fresh lease.
+                conn.lease.begin()
+                return conn
+
+            pool.get_connection.side_effect = _checkout
+            pool.release.side_effect = lambda c, bucket=self.released: bucket.append(c)
+            redis_node = MagicMock()
+            redis_node.connection = None
+            redis_node.connection_pool = pool
+            redis_node.parse_response = lambda connection, command_name, **kwargs: (
+                connection.parse_response(command_name, **kwargs)
+            )
+            self.pools[name] = pool
+            self.redis_nodes[name] = redis_node
+
+        self.key_to_node = {
+            "k1": self.nodes[1],
+            "k2": self.nodes[2],
+            "k3": self.nodes[3],
+        }
+
+        pipe = MagicMock()
+        pipe.nodes_manager = MagicMock()
+        pipe._policy_resolver.resolve.return_value = CommandPolicies()
+        pipe.get_default_node.return_value = None
+        pipe.command_flags = {}
+        pipe.get_redis_connection.side_effect = lambda node: self.redis_nodes[
+            int(node.name.split("-")[1])
+        ]
+
+        self.strategy = PipelineStrategy(pipe)
+        # No HIMPORT preflight in this unit test.
+        self.strategy._himport_prepare_pipeline = lambda *a, **k: None
+        self.strategy._determine_nodes = lambda *args, **kwargs: [
+            self.key_to_node[args[1]]
+        ]
+
+    def stack(self):
+        return [
+            PipelineCommand(("GET", "k1"), {}, 0),
+            PipelineCommand(("GET", "k2"), {}, 1),
+            PipelineCommand(("GET", "k3"), {}, 2),
+        ]
+
+    def send(self):
+        return self.strategy._send_cluster_commands(
+            self.stack(), allow_redirections=False
+        )
+
+
+class TestSyncMultiNodeLeaseLifecycle:
+    """Offline tests for the sync ClusterPipeline._send_cluster_commands
+    lease exit (multi-node: only dirty nodes disconnect, every leased slot
+    is returned)."""
+
+    def test_all_success_every_node_completed_connected_released(self):
+        harness = _MultiNodeHarness(
+            {
+                1: _MultiNodeFakeConnection(1),
+                2: _MultiNodeFakeConnection(2),
+                3: _MultiNodeFakeConnection(3),
+            }
+        )
+
+        harness.send()
+
+        for name, conn in harness.conns.items():
+            assert conn.lease.phase is LeasePhase.COMPLETED, name
+            assert conn.is_connected is True, name
+            assert conn.disconnect_count == 0, name
+            harness.pools[name].release.assert_called_once_with(conn)
+        assert len(harness.released) == 3
+
+    def test_captured_read_transport_error_dirties_only_that_node(self):
+        # Node 2's first read raises a transport error. NodeCommands.read()
+        # captures it into every command result of the node and returns, so
+        # node 3 still gets read; node 2's remaining replies are unread.
+        harness = _MultiNodeHarness(
+            {
+                1: _MultiNodeFakeConnection(1),
+                2: _MultiNodeFakeConnection(
+                    2, read_raises=ConnectionError("simulated read failure")
+                ),
+                3: _MultiNodeFakeConnection(3),
+            }
+        )
+
+        # The captured transport error is surfaced after the finally block
+        # already decided the per-node terminals (allow_redirections=False).
+        with pytest.raises(ConnectionError, match="simulated read failure"):
+            harness.send()
+
+        clean_a, dirty_b, clean_c = (harness.conns[i] for i in (1, 2, 3))
+        assert clean_a.lease.phase is LeasePhase.COMPLETED
+        assert dirty_b.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert clean_c.lease.phase is LeasePhase.COMPLETED
+        assert clean_a.disconnect_count == 0
+        assert dirty_b.disconnect_count == 1
+        assert dirty_b.is_connected is False
+        assert clean_c.disconnect_count == 0
+        # Every leased slot is returned exactly once.
+        for name, conn in harness.conns.items():
+            harness.pools[name].release.assert_called_once_with(conn)
+        assert sorted(harness.released, key=lambda c: c.port) == sorted(
+            harness.conns.values(), key=lambda c: c.port
+        )
+
+    def test_response_error_replies_leave_node_clean(self):
+        harness = _MultiNodeHarness(
+            {
+                1: _MultiNodeFakeConnection(1),
+                2: _MultiNodeFakeConnection(
+                    2, read_raises=ResponseError("simulated server error")
+                ),
+                3: _MultiNodeFakeConnection(3),
+            }
+        )
+
+        with pytest.raises(ResponseError, match="simulated server error"):
+            harness.send()
+
+        for name, conn in harness.conns.items():
+            assert conn.lease.phase is LeasePhase.COMPLETED, name
+            assert conn.is_connected is True, name
+            assert conn.disconnect_count == 0, name
+
+    def test_pack_failure_mid_writes_dirties_written_not_unwritten(self):
+        # pack_commands fails on node 2 before any byte is sent there;
+        # node 1 was already fully written but not read, node 3 not written.
+        harness = _MultiNodeHarness(
+            {
+                1: _MultiNodeFakeConnection(1),
+                2: _MultiNodeFakeConnection(
+                    2, pack_raises=DataError("simulated encoding failure")
+                ),
+                3: _MultiNodeFakeConnection(3),
+            }
+        )
+
+        with pytest.raises(DataError, match="simulated encoding failure"):
+            harness.send()
+
+        written_a, failed_b, unwritten_c = (harness.conns[i] for i in (1, 2, 3))
+        assert written_a.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert failed_b.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert unwritten_c.lease.phase is LeasePhase.COMPLETED
+        assert written_a.is_connected is False
+        assert failed_b.is_connected is False
+        # Node 3 was never flown: it must stay connected and reusable.
+        assert unwritten_c.is_connected is True
+        assert unwritten_c.disconnect_count == 0
+        # No slot leaks even when the batch aborts mid-write.
+        for name, conn in harness.conns.items():
+            harness.pools[name].release.assert_called_once_with(conn)
+        assert len(harness.released) == 3
+
+    def test_uncaught_read_exception_dirties_node_and_followers(self):
+        # An error type not captured by NodeCommands.read() (here a raw
+        # OSError) aborts the read loop: node 1 was consumed, nodes 2 and 3
+        # are written-but-unread and must be disconnected.
+        harness = _MultiNodeHarness(
+            {
+                1: _MultiNodeFakeConnection(1),
+                2: _MultiNodeFakeConnection(2, read_raises=OSError("boom")),
+                3: _MultiNodeFakeConnection(3),
+            }
+        )
+
+        with pytest.raises(OSError, match="boom"):
+            harness.send()
+
+        read_a, dirty_b, dirty_c = (harness.conns[i] for i in (1, 2, 3))
+        assert read_a.lease.phase is LeasePhase.COMPLETED
+        assert dirty_b.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert dirty_c.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert read_a.disconnect_count == 0
+        assert dirty_b.disconnect_count == 1
+        assert dirty_c.disconnect_count == 1
+        for name, conn in harness.conns.items():
+            harness.pools[name].release.assert_called_once_with(conn)

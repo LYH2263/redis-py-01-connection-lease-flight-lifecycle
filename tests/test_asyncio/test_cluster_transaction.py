@@ -7,8 +7,9 @@ import pytest
 
 import redis
 from redis import CrossSlotTransactionError, RedisClusterException
+from redis._lease import ConnectionLease, LeasePhase
 from redis.asyncio import RedisCluster, Connection
-from redis.asyncio.cluster import ClusterNode, NodesManager
+from redis.asyncio.cluster import ClusterNode, NodesManager, TransactionStrategy
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
 from redis.cluster import PRIMARY
@@ -147,6 +148,10 @@ class TestClusterTransaction:
         assert strategy._transaction_node is None
         assert strategy._watching is False
         assert leased in node._free
+        # Cancellation while the UNWATCH reply may be unread terminates the
+        # lease dirty and the socket must have been cleared before return.
+        assert leased.lease.phase is redis.LeasePhase.ABORTED_DIRTY
+        assert leased.is_connected is False
 
     @pytest.mark.onlycluster
     async def test_retry_transaction_during_unfinished_slot_migration(self, r):
@@ -450,3 +455,167 @@ class TestClusterTransaction:
 
             assert not pipe._execution_strategy._watching
             assert not len(pipe)
+
+
+class _ResetFakeConnection:
+    """Stand-in connection covering just the surface used by
+    TransactionStrategy.reset()."""
+
+    def __init__(
+        self,
+        read_error: BaseException | None = None,
+        send_error: BaseException | None = None,
+        hang_event: asyncio.Event | None = None,
+        **kwargs,
+    ) -> None:
+        self.host = kwargs.get("host", "127.0.0.1")
+        self.port = kwargs.get("port", 7000)
+        self.db = kwargs.get("db", 0)
+        self.lease = ConnectionLease()
+        self.is_connected = True
+        self.disconnect_count = 0
+        self._should_reconnect = False
+        self._read_error = read_error
+        self._send_error = send_error
+        self._hang_event = hang_event
+
+    def should_reconnect(self) -> bool:
+        return self._should_reconnect
+
+    def mark_for_reconnect(self) -> None:
+        self._should_reconnect = True
+
+    async def disconnect(self) -> None:
+        self.disconnect_count += 1
+        self.is_connected = False
+        self._should_reconnect = False
+
+    async def send_command(self, *args, **kwargs) -> None:
+        self.lease.mark_write_inflight()
+        if self._send_error is not None:
+            raise self._send_error
+
+    async def read_response(self):
+        self.lease.mark_await_read()
+        if self._hang_event is not None:
+            self._hang_event.set()
+            await asyncio.sleep(60)
+        if self._read_error is not None:
+            raise self._read_error
+        return True
+
+
+def _make_node_with_connection(connection: _ResetFakeConnection) -> ClusterNode:
+    return ClusterNode(
+        "127.0.0.1",
+        7000,
+        max_connections=1,
+        connection_class=lambda **kwargs: connection,
+    )
+
+
+def _make_strategy(
+    node: ClusterNode, connection: _ResetFakeConnection, watching: bool
+) -> TransactionStrategy:
+    strategy = TransactionStrategy.__new__(TransactionStrategy)
+    strategy._command_queue = []
+    strategy._watching = watching
+    strategy._transaction_node = node
+    strategy._transaction_connection = connection
+    strategy._explicit_transaction = False
+    strategy._pipeline_slots = set()
+    strategy._executing = False
+    return strategy
+
+
+class TestTransactionStrategyResetLease:
+    """Offline lease-flight tests for the cluster transaction reset exit.
+
+    These deliberately drive TransactionStrategy.reset() directly instead
+    of going through a shared cleanup helper, to keep this exit forked and
+    independently testable (AC-7/AC-8)."""
+
+    async def test_reset_unwatch_success_completed_clean(self) -> None:
+        connection = _ResetFakeConnection()
+        node = _make_node_with_connection(connection)
+        leased = node.acquire_connection()
+        strategy = _make_strategy(node, leased, watching=True)
+
+        await strategy.reset()
+
+        assert leased.lease.phase is LeasePhase.COMPLETED
+        assert leased.is_connected is True
+        assert leased.disconnect_count == 0
+        assert leased in node._free
+        assert strategy._transaction_connection is None
+        assert strategy._watching is False
+
+    async def test_reset_unwatch_connection_error_dirty(self) -> None:
+        connection = _ResetFakeConnection(
+            read_error=redis.exceptions.ConnectionError("simulated read failure")
+        )
+        node = _make_node_with_connection(connection)
+        leased = node.acquire_connection()
+        strategy = _make_strategy(node, leased, watching=True)
+
+        await strategy.reset()
+
+        assert leased.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert leased.is_connected is False
+        assert leased.disconnect_count == 1
+        assert leased in node._free
+        assert strategy._transaction_connection is None
+        assert strategy._watching is False
+
+    async def test_reset_cancelled_during_unwatch_read_dirty(self) -> None:
+        started = asyncio.Event()
+        connection = _ResetFakeConnection(hang_event=started)
+        node = _make_node_with_connection(connection)
+        leased = node.acquire_connection()
+        strategy = _make_strategy(node, leased, watching=True)
+
+        task = asyncio.ensure_future(strategy.reset())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert leased.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert leased.is_connected is False
+        assert leased.disconnect_count == 1
+        # The slot is returned exactly once even though the release path
+        # was reached via cancellation; node.release is synchronous, so a
+        # second CancelledError raised by the loop cannot skip the append.
+        assert node._free.count(leased) == 1
+        assert strategy._transaction_connection is None
+        assert strategy._watching is False
+
+    async def test_reset_cancelled_during_unwatch_send_dirty(self) -> None:
+        connection = _ResetFakeConnection(send_error=asyncio.CancelledError())
+        node = _make_node_with_connection(connection)
+        leased = node.acquire_connection()
+        strategy = _make_strategy(node, leased, watching=True)
+
+        with pytest.raises(asyncio.CancelledError):
+            await strategy.reset()
+
+        assert leased.lease.phase is LeasePhase.ABORTED_DIRTY
+        assert leased.is_connected is False
+        assert leased in node._free
+
+    async def test_reset_non_watching_held_connection_completed_clean(self) -> None:
+        # After a batched MULTI/EXEC the pinned connection is returned
+        # through reset() without an UNWATCH round trip.
+        connection = _ResetFakeConnection()
+        node = _make_node_with_connection(connection)
+        leased = node.acquire_connection()
+        leased.lease.mark_write_inflight()
+        leased.lease.mark_await_read()
+        strategy = _make_strategy(node, leased, watching=False)
+
+        await strategy.reset()
+
+        assert leased.lease.phase is LeasePhase.COMPLETED
+        assert leased.is_connected is True
+        assert leased.disconnect_count == 0
+        assert leased in node._free
